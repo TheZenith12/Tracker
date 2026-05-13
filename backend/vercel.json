@@ -14,11 +14,5 @@
       "src": "/(.*)",
       "dest": "api/index.ts"
     }
-  ],
-  "functions": {
-    "api/index.ts": {
-      "memory": 1024,
-      "maxDuration": 30
-    }
-  }
+  ]
 }
