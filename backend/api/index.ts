@@ -1,24 +1,31 @@
 import { NestFactory } from '@nestjs/core'
-import { ExpressAdapter } from '@nestjs/platform-express'
 import { ValidationPipe } from '@nestjs/common'
 import { AppModule } from '../src/app.module'
-import * as express from 'express'
-import { configure as serverlessExpress } from '@vendia/serverless-express'
-import { VercelRequest, VercelResponse } from '@vercel/node'
 
-let server: any
+let cachedApp: any
 
 async function bootstrap() {
-  const expressApp = express()
-  const app = await NestFactory.create(AppModule, new ExpressAdapter(expressApp), { logger: false })
-  app.setGlobalPrefix('api/v1')
-  app.enableCors({ origin: process.env.APP_URL || '*', credentials: true })
-  app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }))
-  await app.init()
-  return serverlessExpress({ app: expressApp })
+  if (cachedApp) return cachedApp
+  try {
+    const app = await NestFactory.create(AppModule, { logger: ['error', 'warn'] })
+    app.setGlobalPrefix('api/v1')
+    app.enableCors({ origin: process.env.APP_URL || '*', credentials: true })
+    app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }))
+    await app.init()
+    cachedApp = app.getHttpAdapter().getInstance()
+  } catch (err) {
+    console.error('Bootstrap error:', err)
+    throw err
+  }
+  return cachedApp
 }
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  server = server ?? (await bootstrap())
-  return server(req, res)
+export default async (req: any, res: any) => {
+  try {
+    const app = await bootstrap()
+    app(req, res)
+  } catch (err) {
+    console.error('Handler error:', err)
+    res.status(500).json({ message: 'Internal server error', error: String(err) })
+  }
 }
