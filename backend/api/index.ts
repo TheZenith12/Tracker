@@ -9,7 +9,21 @@ async function bootstrap() {
   try {
     const app = await NestFactory.create(AppModule, { logger: ['error', 'warn'] })
     app.setGlobalPrefix('api/v1')
-    app.enableCors({ origin: process.env.APP_URL || '*', credentials: true })
+    const allowedOrigins = [
+      process.env.APP_URL,
+      'https://tracker-eosin-eta.vercel.app',
+      'http://localhost:3000',
+    ].filter(Boolean)
+    app.enableCors({
+      origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin)) {
+          callback(null, true)
+        } else {
+          callback(null, false)
+        }
+      },
+      credentials: true,
+    })
     app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }))
     await app.init()
     cachedApp = app.getHttpAdapter().getInstance()
