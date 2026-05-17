@@ -5,7 +5,7 @@
       "src": "api/index.ts",
       "use": "@vercel/node",
       "config": {
-        "includeFiles": ["src/**", "prisma/**", "node_modules/.prisma/**", "node_modules/@prisma/**"]
+        "includeFiles": ["src/**", "node_modules/@nestjs/**", "node_modules/mongoose/**", "node_modules/@anthropic-ai/**"]
       }
     }
   ],

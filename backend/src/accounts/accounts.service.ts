@@ -1,77 +1,44 @@
-import { Injectable, NotFoundException, ForbiddenException } from '@nestjs/common';
-import { PrismaService } from '../prisma/prisma.service';
-import { CreateAccountDto } from './dto/create-account.dto';
-import { UpdateAccountDto } from './dto/update-account.dto';
-import { TransferDto } from './dto/transfer.dto';
+import { Injectable, NotFoundException, ForbiddenException } from '@nestjs/common'
+import { InjectModel } from '@nestjs/mongoose'
+import { Model, Types } from 'mongoose'
+import { Account, AccountDocument } from '../schemas/account.schema'
+import { Transaction, TransactionDocument } from '../schemas/transaction.schema'
+import { CreateAccountDto } from './dto/create-account.dto'
+import { UpdateAccountDto } from './dto/update-account.dto'
 
 @Injectable()
 export class AccountsService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    @InjectModel(Account.name) private accountModel: Model<AccountDocument>,
+    @InjectModel(Transaction.name) private txModel: Model<TransactionDocument>,
+  ) {}
 
   async findAll(userId: string) {
-    const accounts = await this.prisma.account.findMany({
-      where: { userId },
-      orderBy: [{ isDefault: 'desc' }, { createdAt: 'asc' }],
-    });
-    return accounts;
+    const accounts = await this.accountModel.find({ userId }).sort({ isDefault: -1, createdAt: 1 })
+    return accounts.map(a => ({ ...a.toObject(), id: a._id.toString() }))
   }
 
   async findOne(userId: string, id: string) {
-    const account = await this.prisma.account.findFirst({ where: { id, userId } });
-    if (!account) throw new NotFoundException('Данс олдсонгүй');
-    return account;
+    const account = await this.accountModel.findOne({ _id: id, userId })
+    if (!account) throw new NotFoundException('Данс олдсонгүй')
+    return account
   }
 
   async create(userId: string, dto: CreateAccountDto) {
-    return this.prisma.account.create({
-      data: { ...dto, userId },
-    });
+    const account = await this.accountModel.create({ ...dto, userId })
+    return { ...account.toObject(), id: account._id.toString() }
   }
 
   async update(userId: string, id: string, dto: UpdateAccountDto) {
-    await this.findOne(userId, id);
-    return this.prisma.account.update({ where: { id }, data: dto });
+    await this.findOne(userId, id)
+    const updated = await this.accountModel.findByIdAndUpdate(id, dto, { new: true })
+    return { ...updated.toObject(), id: updated._id.toString() }
   }
 
   async remove(userId: string, id: string) {
-    const account = await this.findOne(userId, id);
-    if (account.isDefault) throw new ForbiddenException('Үндсэн дансыг устгах боломжгүй');
-    return this.prisma.account.delete({ where: { id } });
-  }
-
-  async transfer(userId: string, dto: TransferDto) {
-    const [fromAccount, toAccount] = await Promise.all([
-      this.findOne(userId, dto.fromAccountId),
-      this.findOne(userId, dto.toAccountId),
-    ]);
-
-    return this.prisma.$transaction([
-      this.prisma.account.update({
-        where: { id: fromAccount.id },
-        data: { balance: { decrement: dto.amount } },
-      }),
-      this.prisma.account.update({
-        where: { id: toAccount.id },
-        data: { balance: { increment: dto.amount } },
-      }),
-      this.prisma.transaction.create({
-        data: {
-          fromAccountId: dto.fromAccountId,
-          toAccountId: dto.toAccountId,
-          type: 'TRANSFER',
-          amount: dto.amount,
-          description: dto.description || 'Шилжүүлэг',
-          date: new Date(),
-        },
-      }),
-    ]);
-  }
-
-  async getTotalBalance(userId: string) {
-    const accounts = await this.prisma.account.findMany({ where: { userId } });
-    const mntTotal = accounts
-      .filter(a => a.currency === 'MNT')
-      .reduce((sum, a) => sum + Number(a.balance), 0);
-    return { mntTotal, accounts };
+    const account = await this.findOne(userId, id)
+    if (account.isDefault) throw new ForbiddenException('Үндсэн дансыг устгах боломжгүй')
+    await this.accountModel.findByIdAndDelete(id)
+    return { message: 'Данс устгагдлаа' }
   }
 }

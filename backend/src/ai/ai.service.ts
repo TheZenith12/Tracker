@@ -1,124 +1,93 @@
-import { Injectable, InternalServerErrorException } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import Anthropic from '@anthropic-ai/sdk';
-import { PrismaService } from '../prisma/prisma.service';
+import { Injectable, InternalServerErrorException } from '@nestjs/common'
+import { InjectModel } from '@nestjs/mongoose'
+import { ConfigService } from '@nestjs/config'
+import { Model, Types } from 'mongoose'
+import Anthropic from '@anthropic-ai/sdk'
+import { Account, AccountDocument } from '../schemas/account.schema'
+import { Transaction, TransactionDocument } from '../schemas/transaction.schema'
+import { Budget, BudgetDocument } from '../schemas/budget.schema'
 
 @Injectable()
 export class AiService {
-  private client: Anthropic;
+  private client: Anthropic
 
   constructor(
-    private prisma: PrismaService,
+    @InjectModel(Account.name) private accountModel: Model<AccountDocument>,
+    @InjectModel(Transaction.name) private txModel: Model<TransactionDocument>,
+    @InjectModel(Budget.name) private budgetModel: Model<BudgetDocument>,
     private config: ConfigService,
   ) {
-    this.client = new Anthropic({ apiKey: this.config.get('ANTHROPIC_API_KEY') });
+    this.client = new Anthropic({ apiKey: this.config.get('ANTHROPIC_API_KEY') })
   }
 
   async getAdvice(userId: string): Promise<{ advice: string; generatedAt: string }> {
-    const now = new Date();
-    const month = now.getMonth() + 1;
-    const year = now.getFullYear();
-    const monthStart = new Date(year, month - 1, 1);
-    const monthEnd = new Date(year, month, 0, 23, 59, 59);
+    const now = new Date()
+    const month = now.getMonth() + 1
+    const year = now.getFullYear()
+    const start = new Date(year, month - 1, 1)
+    const end = new Date(year, month, 0, 23, 59, 59)
+    const uid = new Types.ObjectId(userId)
 
-    const [accounts, txSummary, categoryBreakdown, budgets] = await Promise.all([
-      this.prisma.account.findMany({
-        where: { userId },
-        select: { name: true, type: true, balance: true, currency: true },
-      }),
-      this.prisma.transaction.groupBy({
-        by: ['type'],
-        where: { fromAccount: { userId }, date: { gte: monthStart, lte: monthEnd } },
-        _sum: { amount: true },
-        _count: true,
-      }),
-      this.prisma.transaction.groupBy({
-        by: ['categoryId'],
-        where: {
-          fromAccount: { userId },
-          type: 'EXPENSE',
-          date: { gte: monthStart, lte: monthEnd },
-        },
-        _sum: { amount: true },
-        orderBy: { _sum: { amount: 'desc' } },
-        take: 5,
-      }),
-      this.prisma.budget.findMany({
-        where: { userId, month, year },
-        include: { category: { select: { name: true } } },
-      }),
-    ]);
+    const [accounts, txs, budgets] = await Promise.all([
+      this.accountModel.find({ userId: uid }),
+      this.txModel.find({ userId: uid, date: { $gte: start, $lte: end }, type: { $in: ['INCOME', 'EXPENSE'] } })
+        .populate('categoryId', 'name'),
+      this.budgetModel.find({ userId: uid, month, year }).populate('categoryId', 'name'),
+    ])
 
-    // Resolve category names for the breakdown
-    const categoryIds = categoryBreakdown.map(c => c.categoryId).filter(Boolean) as string[];
-    const categories = await this.prisma.category.findMany({
-      where: { id: { in: categoryIds } },
-      select: { id: true, name: true },
-    });
-    const catMap = Object.fromEntries(categories.map(c => [c.id, c.name]));
+    const income = txs.filter(t => t.type === 'INCOME').reduce((s, t) => s + t.amount, 0)
+    const expense = txs.filter(t => t.type === 'EXPENSE').reduce((s, t) => s + t.amount, 0)
+    const totalBalance = accounts.reduce((s, a) => s + a.balance, 0)
 
-    // Build budget spending data
-    const budgetData = await Promise.all(
-      budgets.map(async b => {
-        const spent = await this.prisma.transaction.aggregate({
-          where: {
-            fromAccount: { userId },
-            categoryId: b.categoryId,
-            type: 'EXPENSE',
-            date: { gte: monthStart, lte: monthEnd },
-          },
-          _sum: { amount: true },
-        });
-        return {
-          category: b.category.name,
-          limit: Number(b.limit),
-          spent: Number(spent._sum.amount || 0),
-        };
-      }),
-    );
+    const catMap: Record<string, number> = {}
+    for (const t of txs.filter(t => t.type === 'EXPENSE')) {
+      const name = (t.categoryId as any)?.name || 'Бусад'
+      catMap[name] = (catMap[name] || 0) + t.amount
+    }
+    const topCats = Object.entries(catMap).sort((a, b) => b[1] - a[1]).slice(0, 5)
 
-    const totalIncome = Number(txSummary.find(s => s.type === 'INCOME')?._sum.amount || 0);
-    const totalExpense = Number(txSummary.find(s => s.type === 'EXPENSE')?._sum.amount || 0);
-    const totalBalance = accounts.reduce((sum, a) => sum + Number(a.balance), 0);
+    const budgetLines = await Promise.all(budgets.map(async b => {
+      const spent = txs.filter(t => t.type === 'EXPENSE' && t.categoryId?.toString() === b.categoryId?.toString())
+        .reduce((s, t) => s + t.amount, 0)
+      return `- ${(b.categoryId as any)?.name}: ${spent.toLocaleString()} / ${b.limit.toLocaleString()} ₮`
+    }))
 
     const prompt = `
 Та доорх хэрэглэгчийн санхүүгийн мэдээллийг үндэслэн Монгол хэлээр хувийн зөвлөгөө өгнө үү.
 
 ## Дансны мэдээлэл
-${accounts.map(a => `- ${a.name} (${a.type}): ${Number(a.balance).toLocaleString()} ${a.currency}`).join('\n')}
+${accounts.map(a => `- ${a.name} (${a.type}): ${a.balance.toLocaleString()} ${a.currency}`).join('\n')}
 Нийт үлдэгдэл: ${totalBalance.toLocaleString()} ₮
 
-## ${month}-р сарын гүйлгээний хураангуй
-- Нийт орлого: ${totalIncome.toLocaleString()} ₮
-- Нийт зарлага: ${totalExpense.toLocaleString()} ₮
-- Цэвэр хуримтлал: ${(totalIncome - totalExpense).toLocaleString()} ₮
+## ${month}-р сарын хураангуй
+- Нийт орлого: ${income.toLocaleString()} ₮
+- Нийт зарлага: ${expense.toLocaleString()} ₮
+- Цэвэр хуримтлал: ${(income - expense).toLocaleString()} ₮
 
-## Зарлагын топ ангиллууд (${month}-р сар)
-${categoryBreakdown.map(c => `- ${catMap[c.categoryId!] || 'Бусад'}: ${Number(c._sum.amount || 0).toLocaleString()} ₮`).join('\n') || '- Мэдээлэл алга'}
+## Зарлагын топ ангиллууд
+${topCats.map(([n, a]) => `- ${n}: ${a.toLocaleString()} ₮`).join('\n') || '- Мэдээлэл алга'}
 
 ## Төсвийн биелэлт
-${budgetData.length > 0 ? budgetData.map(b => `- ${b.category}: ${b.spent.toLocaleString()} / ${b.limit.toLocaleString()} ₮ (${Math.round((b.spent / b.limit) * 100)}%)`).join('\n') : '- Төсөв тохируулаагүй'}
+${budgetLines.join('\n') || '- Төсөв тохируулаагүй'}
 
-Дээрх мэдээллийг харгалзан:
+Дээрх мэдээллийг харгалзан 200-300 үгэнд:
 1. Санхүүгийн байдлын товч үнэлгээ
-2. 2-3 практик зөвлөгөө (хуримтлал нэмэгдүүлэх, зарлагаа багасгах эсвэл шаардлагатай бол)
-3. Тухайн сарын гүйцэтгэлийн дүгнэлт
+2. 2-3 практик зөвлөгөө
+3. Сарын гүйцэтгэлийн дүгнэлт
 
-Зөвлөгөөг найрсаг, тодорхой, 200-300 үгэнд багтааж бичнэ үү. Markdown formatting ашиглаж болно (## гарчиг, **тод**, - жагсаалт).
-`.trim();
+Markdown ашигла (## гарчиг, **тод**, - жагсаалт).`.trim()
 
     try {
-      const message = await this.client.messages.create({
+      const msg = await this.client.messages.create({
         model: 'claude-opus-4-7',
         max_tokens: 1024,
-        messages: [{ role: 'user', content: prompt }],
         system: 'Та хувийн санхүүгийн зөвлөх бөгөөд Монгол хэлээр тодорхой, практик зөвлөгөө өгдөг.',
-      });
-
-      const advice = message.content[0].type === 'text' ? message.content[0].text : '';
-      return { advice, generatedAt: new Date().toISOString() };
-    } catch (err) {
-      throw new InternalServerErrorException('AI зөвлөгөө авахад алдаа гарлаа');
+        messages: [{ role: 'user', content: prompt }],
+      })
+      const advice = msg.content[0].type === 'text' ? msg.content[0].text : ''
+      return { advice, generatedAt: new Date().toISOString() }
+    } catch {
+      throw new InternalServerErrorException('AI зөвлөгөө авахад алдаа гарлаа')
     }
   }
 }

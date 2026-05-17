@@ -1,23 +1,27 @@
-import { Injectable } from '@nestjs/common';
-import { PrismaService } from '../prisma/prisma.service';
-import { CreateCategoryDto } from './dto/create-category.dto';
+import { Injectable } from '@nestjs/common'
+import { InjectModel } from '@nestjs/mongoose'
+import { Model } from 'mongoose'
+import { Category, CategoryDocument } from '../schemas/category.schema'
+import { CreateCategoryDto } from './dto/create-category.dto'
 
 @Injectable()
 export class CategoriesService {
-  constructor(private prisma: PrismaService) {}
+  constructor(@InjectModel(Category.name) private categoryModel: Model<CategoryDocument>) {}
 
   async findAll(userId: string) {
-    return this.prisma.category.findMany({
-      where: { OR: [{ userId }, { isDefault: true, userId: null }] },
-      orderBy: [{ isDefault: 'desc' }, { name: 'asc' }],
-    });
+    const cats = await this.categoryModel
+      .find({ $or: [{ userId }, { userId: null }] })
+      .sort({ isDefault: -1, name: 1 })
+    return cats.map(c => ({ ...c.toObject(), id: c._id.toString() }))
   }
 
   async create(userId: string, dto: CreateCategoryDto) {
-    return this.prisma.category.create({ data: { ...dto, userId } });
+    const cat = await this.categoryModel.create({ ...dto, userId })
+    return { ...cat.toObject(), id: cat._id.toString() }
   }
 
   async remove(userId: string, id: string) {
-    return this.prisma.category.deleteMany({ where: { id, userId } });
+    await this.categoryModel.deleteOne({ _id: id, userId })
+    return { message: 'Ангилал устгагдлаа' }
   }
 }

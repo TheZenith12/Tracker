@@ -1,107 +1,96 @@
-import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
-import { PrismaService } from '../prisma/prisma.service';
-import { CreateRecurringDto } from './dto/create-recurring.dto';
+import { Injectable, Logger } from '@nestjs/common'
+import { Cron, CronExpression } from '@nestjs/schedule'
+import { InjectModel } from '@nestjs/mongoose'
+import { Model, Types } from 'mongoose'
+import { Recurring, RecurringDocument } from '../schemas/recurring.schema'
+import { Transaction, TransactionDocument } from '../schemas/transaction.schema'
+import { Account, AccountDocument } from '../schemas/account.schema'
+import { CreateRecurringDto } from './dto/create-recurring.dto'
 
 @Injectable()
 export class RecurringService {
-  private readonly logger = new Logger(RecurringService.name);
+  private readonly logger = new Logger(RecurringService.name)
 
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    @InjectModel(Recurring.name) private recurringModel: Model<RecurringDocument>,
+    @InjectModel(Transaction.name) private txModel: Model<TransactionDocument>,
+    @InjectModel(Account.name) private accountModel: Model<AccountDocument>,
+  ) {}
 
   async findAll(userId: string) {
-    return this.prisma.recurringTransaction.findMany({
-      where: { userId },
-      include: { user: { select: { id: true } } },
-      orderBy: { nextDate: 'asc' },
-    });
+    const list = await this.recurringModel.find({ userId }).sort({ nextDate: 1 })
+    return list.map(r => ({ ...r.toObject(), id: r._id.toString() }))
   }
 
   async create(userId: string, dto: CreateRecurringDto) {
-    return this.prisma.recurringTransaction.create({
-      data: {
-        userId,
-        title: dto.title,
-        amount: dto.amount,
-        type: dto.type,
-        categoryId: dto.categoryId,
-        accountId: dto.accountId,
-        frequency: dto.frequency || 'MONTHLY',
-        startDate: new Date(dto.startDate),
-        nextDate: new Date(dto.startDate),
-        endDate: dto.endDate ? new Date(dto.endDate) : null,
-      },
-    });
+    const r = await this.recurringModel.create({
+      userId,
+      title: dto.title,
+      amount: dto.amount,
+      type: dto.type,
+      categoryId: dto.categoryId || null,
+      accountId: dto.accountId,
+      frequency: dto.frequency || 'MONTHLY',
+      startDate: new Date(dto.startDate),
+      nextDate: new Date(dto.startDate),
+      endDate: dto.endDate ? new Date(dto.endDate) : null,
+    })
+    return { ...r.toObject(), id: r._id.toString() }
   }
 
   async togglePause(userId: string, id: string) {
-    const recurring = await this.prisma.recurringTransaction.findFirst({ where: { id, userId } });
-    if (!recurring) return null;
-    return this.prisma.recurringTransaction.update({
-      where: { id },
-      data: { isPaused: !recurring.isPaused },
-    });
+    const r = await this.recurringModel.findOne({ _id: id, userId })
+    if (!r) return null
+    r.isPaused = !r.isPaused
+    await r.save()
+    return { ...r.toObject(), id: r._id.toString() }
   }
 
   async remove(userId: string, id: string) {
-    return this.prisma.recurringTransaction.deleteMany({ where: { id, userId } });
+    await this.recurringModel.deleteOne({ _id: id, userId })
+    return { message: 'Устгагдлаа' }
   }
 
   @Cron(CronExpression.EVERY_DAY_AT_MIDNIGHT)
   async processRecurring() {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
 
-    const due = await this.prisma.recurringTransaction.findMany({
-      where: {
-        isPaused: false,
-        nextDate: { lte: today },
-        OR: [{ endDate: null }, { endDate: { gte: today } }],
-      },
-    });
+    const due = await this.recurringModel.find({
+      isPaused: false,
+      nextDate: { $lte: today },
+      $or: [{ endDate: null }, { endDate: { $gte: today } }],
+    })
 
     for (const r of due) {
       try {
-        const delta = r.type === 'INCOME' ? Number(r.amount) : -Number(r.amount);
-
-        await this.prisma.$transaction([
-          this.prisma.transaction.create({
-            data: {
-              fromAccountId: r.accountId,
-              categoryId: r.categoryId,
-              type: r.type,
-              amount: r.amount,
-              description: r.title,
-              date: today,
-              isRecurring: true,
-              recurringId: r.id,
-            },
-          }),
-          this.prisma.account.update({
-            where: { id: r.accountId },
-            data: { balance: { increment: delta } },
-          }),
-          this.prisma.recurringTransaction.update({
-            where: { id: r.id },
-            data: { nextDate: this.calcNextDate(today, r.frequency) },
-          }),
-        ]);
-
-        this.logger.log(`Processed recurring: ${r.title}`);
+        const delta = r.type === 'INCOME' ? r.amount : -r.amount
+        await this.txModel.create({
+          userId: r.userId,
+          fromAccountId: r.accountId,
+          categoryId: r.categoryId,
+          type: r.type,
+          amount: r.amount,
+          description: r.title,
+          date: today,
+          isRecurring: true,
+          recurringId: r._id,
+        })
+        await this.accountModel.findByIdAndUpdate(r.accountId, { $inc: { balance: delta } })
+        await this.recurringModel.findByIdAndUpdate(r._id, { nextDate: this.calcNext(today, r.frequency) })
+        this.logger.log(`Processed: ${r.title}`)
       } catch (err) {
-        this.logger.error(`Failed recurring ${r.id}:`, err);
+        this.logger.error(`Failed ${r._id}:`, err)
       }
     }
   }
 
-  private calcNextDate(from: Date, frequency: string): Date {
-    const next = new Date(from);
-    switch (frequency) {
-      case 'DAILY': next.setDate(next.getDate() + 1); break;
-      case 'WEEKLY': next.setDate(next.getDate() + 7); break;
-      case 'MONTHLY': next.setMonth(next.getMonth() + 1); break;
-      case 'YEARLY': next.setFullYear(next.getFullYear() + 1); break;
-    }
-    return next;
+  private calcNext(from: Date, freq: string): Date {
+    const d = new Date(from)
+    if (freq === 'DAILY') d.setDate(d.getDate() + 1)
+    else if (freq === 'WEEKLY') d.setDate(d.getDate() + 7)
+    else if (freq === 'MONTHLY') d.setMonth(d.getMonth() + 1)
+    else if (freq === 'YEARLY') d.setFullYear(d.getFullYear() + 1)
+    return d
   }
 }
